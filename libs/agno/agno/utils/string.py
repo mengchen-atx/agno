@@ -114,6 +114,42 @@ def _extract_json_objects(text: str) -> list[str]:
     return objs
 
 
+def _contains_markdown_fence(value: Any) -> bool:
+    """True if any string in a decoded JSON value contains a markdown fence."""
+    pending: list[Any] = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if "```" in current:
+                return True
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
+def _raw_fenced_json_object(content: str) -> Optional[dict]:
+    """Return the only JSON object when a string inside it contains a markdown fence.
+
+    Cleanup splits on the first fence it sees. That deletes fences stored in
+    string values and drops a prose-prefixed object. Callers accept this object
+    before cleanup. Zero objects, several objects, and objects with no fence
+    return None so the cleanup and merge behavior is unchanged.
+    """
+    candidate_jsons = _extract_json_objects(content)
+    if len(candidate_jsons) != 1:
+        return None
+    try:
+        data = json.loads(candidate_jsons[0])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or not _contains_markdown_fence(data):
+        return None
+    return data
+
+
 def _clean_json_content(content: str) -> str:
     """Clean and prepare JSON content for parsing."""
     # Handle code blocks
@@ -217,6 +253,14 @@ def parse_response_model_str(content: str, output_schema: Type[BaseModel]) -> Op
     if structured_output is not None:
         return structured_output
 
+    # A fence inside a string value is data. Cleanup would split on it.
+    fenced_object = _raw_fenced_json_object(content)
+    if fenced_object is not None:
+        try:
+            return output_schema.model_validate(fenced_object)
+        except ValidationError:
+            pass
+
     # Second attempt: clean content and try again
     cleaned_content = _clean_json_content(content)
 
@@ -264,6 +308,11 @@ def parse_response_dict_str(content: str) -> Optional[dict]:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
+
+    # A fence inside a string value is data. Cleanup would split on it.
+    fenced_object = _raw_fenced_json_object(content)
+    if fenced_object is not None:
+        return fenced_object
 
     # Second attempt: clean content and try again
     cleaned_content = _clean_json_content(content)

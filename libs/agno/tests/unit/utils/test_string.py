@@ -542,3 +542,140 @@ def test_extract_json_objects_ignores_unmatched_opening_brace():
     assert _extract_json_objects(text) == ['{"a": 1}']
     assert parse_response_dict_str(text) == {"a": 1}
     assert _extract_json_objects('Open { here and { there, then {"a": 1} and {"b": 2}') == ['{"a": 1}', '{"b": 2}']
+
+
+class AnswerWithCode(BaseModel):
+    explanation: str
+    code: str
+
+
+class AnswerWithSamples(BaseModel):
+    explanation: str
+    samples: list[str]
+
+
+_INNER_FENCE = "```python\nprint(1)\n```"
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "```json\n{payload}\n```",
+        "```\n{payload}\n```",
+        "Here is the result:\n{payload}",
+        "Here is the result:\n{payload}\nThanks!",
+        "Here is the result:\n```json\n{payload}\n```\nLet me know if you need more help.",
+        "Use {this} marker:\n{payload}",
+        "```json\n{payload}",
+    ],
+)
+def test_parse_response_preserves_inner_code_fence(wrapper):
+    """A fence inside a JSON string survives fenced and prose-prefixed output.
+
+    Regression test: cleanup splits on the first fence, so a fenced object came
+    back with the inner markers removed and a prose-prefixed object was dropped.
+    """
+    payload = {"explanation": "Use a loop.", "code": _INNER_FENCE}
+    content = wrapper.replace("{payload}", json.dumps(payload))
+
+    parsed = parse_response_model_str(content, AnswerWithCode)
+    assert parsed is not None
+    assert parsed.explanation == "Use a loop."
+    assert parsed.code == _INNER_FENCE
+    assert parse_response_dict_str(content) == payload
+
+
+def test_parse_response_preserves_inner_fence_with_nested_json():
+    """Braces and escaped quotes inside an inner fence stay part of the string."""
+    code = '```json\n{"nested": "say \\"hi\\""}\n```'
+    payload = {"explanation": "Nested sample.", "code": code}
+    fenced = "```json\n" + json.dumps(payload) + "\n```"
+    prose = "Here is the result:\n" + json.dumps(payload)
+
+    parsed = parse_response_model_str(fenced, AnswerWithCode)
+    assert parsed is not None
+    assert parsed.code == code
+    assert parse_response_dict_str(prose) == payload
+
+
+def test_parse_response_preserves_multiple_inner_fences():
+    code = "```python\nprint(1)\n```\n```python\nprint(2)\n```"
+    payload = {"explanation": "Two samples.", "code": code}
+    content = "```json\n" + json.dumps(payload) + "\n```"
+
+    parsed = parse_response_model_str(content, AnswerWithCode)
+    assert parsed is not None
+    assert parsed.code == code
+    assert parse_response_dict_str(content) == payload
+
+
+def test_parse_response_preserves_fence_nested_in_list():
+    """A fence stored under a list, not a top-level string, is still preserved."""
+    samples = ["```python\nprint(1)\n```", "plain"]
+    payload = {"explanation": "Two samples.", "samples": samples}
+    content = "Here is the result:\n" + json.dumps(payload)
+
+    parsed = parse_response_model_str(content, AnswerWithSamples)
+    assert parsed is not None
+    assert parsed.samples == samples
+    assert parse_response_dict_str("```json\n" + json.dumps(payload) + "\n```") == payload
+
+
+def test_parse_raw_json_preserves_inner_code_fence():
+    """Valid raw JSON is parsed before cleanup and keeps fences in string values."""
+    payload = {"explanation": "Use a loop.", "code": _INNER_FENCE}
+    content = json.dumps(payload)
+
+    parsed = parse_response_model_str(content, AnswerWithCode)
+    assert parsed is not None
+    assert parsed.code == _INNER_FENCE
+    assert parse_response_dict_str(content) == payload
+
+
+def test_parse_fenced_inner_fence_ignores_json_inside_thinking_block():
+    """A decoy object inside think tags must not hide the fenced answer."""
+    payload = {"explanation": "Use a loop.", "code": _INNER_FENCE}
+    content = (
+        '<think>draft {"explanation": "nope", "code": "```python\\nprint(0)\\n```"}</think>\n'
+        "```json\n" + json.dumps(payload) + "\n```"
+    )
+
+    parsed = parse_response_model_str(content, AnswerWithCode)
+    assert parsed is not None
+    assert parsed.explanation == "Use a loop."
+    assert parsed.code == _INNER_FENCE
+    assert parse_response_dict_str(content) == payload
+
+
+def test_parse_last_json_fence_block_still_wins():
+    """Several fenced objects still use cleanup, which keeps the last json block."""
+    content = '```json\n{"name": "wrong", "value": "0"}\n```\n```json\n{"name": "right", "value": "1"}\n```'
+    result = parse_response_model_str(content, MockModel)
+    assert result is not None
+    assert result.name == "right"
+    assert result.value == "1"
+    assert parse_response_dict_str(content) == {"name": "right", "value": "1"}
+
+
+def test_parse_response_still_merges_markdown_fragment():
+    """One valid object plus a markdown fragment still goes through cleanup.
+
+    The raw-object shortcut applies only when that object contains a fence, so
+    a markdown-formatted sibling is still repaired and merged.
+    """
+    content = '{"unused": true}\n{*"name"*: "test", `"value"`: "123"}'
+    assert parse_response_dict_str(content) == {"unused": True, "name": "test", "value": "123"}
+
+    parsed = parse_response_model_str(content, MockModel)
+    assert parsed is not None
+    assert parsed.name == "test"
+    assert parsed.value == "123"
+
+
+def test_fenced_object_missing_required_field_returns_none():
+    """A fenced object that does not match the schema is not returned as a model."""
+    payload = {"code": _INNER_FENCE}
+    content = "Here is the result:\n" + json.dumps(payload)
+
+    assert parse_response_model_str(content, AnswerWithCode) is None
+    assert parse_response_dict_str(content) == payload
